@@ -10,22 +10,16 @@ import {
   resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import {
-  ApiError,
-  InterruptError,
-  RequestTimeoutError,
-  localValidationError as flagValidationError,
-} from '../lib/errors.js';
+import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
 import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
 import {
+  assertStoredLocalTargetListening,
   buildLocalTargetUrl,
   DEFAULT_LOCAL_HOST,
-  normalizeLocalHost,
-  parseLocalPort,
-  probeLocalPort,
+  parseStoredLocalTarget,
   type LocalPortProbeDeps,
-  type LoopbackHost,
+  type StoredLocalTarget,
 } from '../lib/local-target.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { readSecretFileGuarded } from '../lib/secret-file.js';
@@ -39,6 +33,7 @@ import {
   type Page,
   type PaginationFlags,
 } from '../lib/pagination.js';
+import { createProjectEnvCommand } from './project-env.js';
 
 export interface CliProject {
   id: string;
@@ -262,6 +257,8 @@ export function resolveCreatedProjectId(r: CliCreateProjectResponse): string | u
 }
 
 interface CreateOptions extends CommonOptions {
+  /** `'local'` marks the target as an app on the caller's own machine. */
+  originMode?: 'local';
   type: 'frontend' | 'backend';
   name: string;
   targetUrl?: string;
@@ -275,21 +272,6 @@ interface CreateOptions extends CommonOptions {
   passwordFile?: string;
   instruction?: string;
   idempotencyKey?: string;
-}
-
-function normalizeProjectLocalHost(raw: string | undefined): LoopbackHost {
-  try {
-    return normalizeLocalHost(raw);
-  } catch (err) {
-    if (err instanceof ApiError && typeof err.details?.reason === 'string') {
-      throw flagValidationError(
-        'local-host',
-        err.details.reason.replace('--target-url', '--url'),
-        err.details.accepted,
-      );
-    }
-    throw err;
-  }
 }
 
 export async function runCreate(
@@ -325,22 +307,14 @@ export async function runCreate(
     );
   }
 
-  if (opts.local !== undefined && opts.targetUrl !== undefined) {
-    throw localValidationError('--local and --url are mutually exclusive');
-  }
   if (opts.local !== undefined && opts.type !== 'frontend') {
     throw localValidationError('--local projects are frontend-only');
   }
-  if (opts.localHost !== undefined && opts.local === undefined) {
-    throw localValidationError('--local-host requires --local');
-  }
-  if (opts.local !== undefined && !/^\d+$/.test(opts.local)) {
-    throw localValidationError('--local must be a port number between 1 and 65535');
-  }
-  const localTarget =
-    opts.local !== undefined
-      ? { host: normalizeProjectLocalHost(opts.localHost), port: parseLocalPort(opts.local) }
-      : undefined;
+  const localTarget = parseStoredLocalTarget({
+    local: opts.local,
+    localHost: opts.localHost,
+    url: opts.targetUrl,
+  });
   const targetUrl = localTarget
     ? buildLocalTargetUrl(localTarget.host, localTarget.port)
     : opts.targetUrl;
@@ -391,29 +365,8 @@ export async function runCreate(
     return sample;
   }
 
-  if (localTarget && !opts.skipPreflight) {
-    const outcome = await probeLocalPort(
-      localTarget.host,
-      localTarget.port,
-      deps.localPortProbeDeps,
-    );
-    if (outcome.verdict === 'refuse') {
-      throw ApiError.fromEnvelope({
-        error: {
-          code: 'VALIDATION_ERROR',
-          message: `Nothing is listening on ${targetUrl}. Start your app first, or pass --skip-preflight.`,
-          nextAction: 'Verify --local and --local-host match the app you want to test.',
-          requestId: 'local',
-          details: {
-            field: 'local',
-            reason: 'local-port-not-listening',
-            host: localTarget.host,
-            port: localTarget.port,
-            probeReason: outcome.reason,
-          },
-        },
-      });
-    }
+  if (localTarget) {
+    await assertStoredLocalTargetListening(localTarget, opts, deps.localPortProbeDeps);
   }
 
   // Resolve password: flag > file > none
@@ -537,6 +490,14 @@ interface UpdateOptions extends CommonOptions {
   projectId: string;
   name?: string;
   targetUrl?: string;
+  /**
+   * `--local <port>`: point the project at an app on this machine. The same
+   * spelling as `project create`; builds the loopback URL and sends the
+   * `originMode: 'local'` marker that lets the server store it.
+   */
+  local?: string;
+  localHost?: string;
+  skipPreflight?: boolean;
   username?: string;
   password?: string;
   passwordFile?: string;
@@ -569,12 +530,24 @@ export async function runUpdate(
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
-  // P2-7: guard --url against localhost/RFC1918/non-http(s).
+  // `--local <port>` is the one way to point a project at an app on this
+  // machine, on update exactly as on create. A loopback `--url` has no
+  // accepted form here and is redirected to `--local`. The project's type is
+  // not known client-side on update; the server refuses `--local` on a
+  // backend project.
+  const localTarget = parseStoredLocalTarget({
+    local: opts.local,
+    localHost: opts.localHost,
+    url: opts.targetUrl,
+  });
+  const targetUrl = localTarget
+    ? buildLocalTargetUrl(localTarget.host, localTarget.port)
+    : opts.targetUrl;
   if (opts.targetUrl !== undefined) {
     assertNotLocal(opts.targetUrl, {
       field: 'url',
       helpCommand: 'testsprite project update',
-      hintContext: 'bootstrap',
+      hintContext: 'local-project-create',
     });
   }
 
@@ -586,7 +559,7 @@ export async function runUpdate(
   const passwordSupplied = opts.password !== undefined || opts.passwordFile !== undefined;
   const mutableFields: Record<string, boolean> = {
     name: opts.name !== undefined,
-    targetUrl: opts.targetUrl !== undefined,
+    targetUrl: targetUrl !== undefined,
     username: opts.username !== undefined,
     password: passwordSupplied,
     instruction: opts.instruction !== undefined,
@@ -621,8 +594,12 @@ export async function runUpdate(
       updatedFields: presentFieldNames,
       updatedAt: '2026-05-16T00:00:00.000Z',
     };
-    out.print(sample, data => renderUpdateText(data as CliUpdateProjectResponse));
+    out.print(sample, data => renderUpdateText(data as CliUpdateProjectResponse, localTarget));
     return sample;
+  }
+
+  if (localTarget) {
+    await assertStoredLocalTargetListening(localTarget, opts, deps.localPortProbeDeps);
   }
 
   // Resolve password only on the real path. Dry-run must not touch the
@@ -639,7 +616,8 @@ export async function runUpdate(
 
   const bodyFields: Record<string, string | string[] | null | undefined> = {
     name: opts.name,
-    targetUrl: opts.targetUrl,
+    targetUrl,
+    originMode: localTarget ? 'local' : undefined,
     username: opts.username,
     password,
     instruction: opts.instruction,
@@ -673,7 +651,7 @@ export async function runUpdate(
       : {}),
   };
 
-  out.print(updated, data => renderUpdateText(data as CliUpdateProjectResponse));
+  out.print(updated, data => renderUpdateText(data as CliUpdateProjectResponse, localTarget));
   return updated;
 }
 
@@ -1549,7 +1527,16 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .command('update <project-id>')
     .description('Update project metadata')
     .option('--name <name>', 'new project name')
-    .option('--url <url>', 'new target URL')
+    .option('--url <url>', 'new target URL (public; for an app on this machine use --local)')
+    .option(
+      '--local <port>',
+      'point the project at an app on this machine (1-65535; excludes --url; frontend only)',
+    )
+    .option(
+      '--local-host <host>',
+      'loopback host: localhost, 127.0.0.1 (default), or ::1; requires --local',
+    )
+    .option('--skip-preflight', 'skip the local TCP listener check before the update')
     .option('--username <user>', 'new auth username')
     .option('--password <pw>', 'new auth password')
     .option('--password-file <path>', 'read new password from file')
@@ -1576,6 +1563,9 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
           projectId,
           name: cmdOpts.name,
           targetUrl: cmdOpts.url,
+          local: cmdOpts.local,
+          localHost: cmdOpts.localHost,
+          skipPreflight: cmdOpts.skipPreflight,
           username: cmdOpts.username,
           password: cmdOpts.password,
           passwordFile: cmdOpts.passwordFile,
@@ -1753,6 +1743,9 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       );
     });
   project.addCommand(docs);
+  // DEV-1305: `project env <verb>` — the per-project environment surface
+  // (credentials, URL, default). Own module; `deps` threaded so tests inject.
+  project.addCommand(createProjectEnvCommand(deps));
 
   return project;
 }
@@ -1791,6 +1784,9 @@ interface CreateFlagOpts {
 interface UpdateFlagOpts {
   name?: string;
   url?: string;
+  local?: string;
+  localHost?: string;
+  skipPreflight?: boolean;
   username?: string;
   password?: string;
   passwordFile?: string;
@@ -2006,7 +2002,7 @@ function renderProjectText(p: CliProject): string {
  */
 function renderCreateProjectText(
   p: CliCreateProjectResponse,
-  localTarget?: { host: LoopbackHost; port: number },
+  localTarget?: StoredLocalTarget,
 ): string {
   const lines = [
     `id:          ${resolveCreatedProjectId(p) ?? '(unknown)'}`,
@@ -2033,12 +2029,21 @@ function renderCreateProjectText(
   return lines.join('\n');
 }
 
-function renderUpdateText(r: CliUpdateProjectResponse): string {
+function renderUpdateText(r: CliUpdateProjectResponse, localTarget?: StoredLocalTarget): string {
   const lines = [
     `id:            ${resolveUpdatedProjectId(r) ?? '(unknown)'}`,
     `updatedFields: ${r.updatedFields?.join(', ') ?? '(none)'}`,
   ];
   if (r.updatedAt !== undefined) lines.push(`updatedAt:     ${r.updatedAt}`);
+  if (localTarget) {
+    const url = buildLocalTargetUrl(localTarget.host, localTarget.port);
+    const hostFlag =
+      localTarget.host === DEFAULT_LOCAL_HOST ? '' : ` --local-host ${localTarget.host}`;
+    lines.push(
+      `Local project: TestSprite will reach ${url} only through a tunnel from this machine.`,
+      `Run its tests with: testsprite test run <test-id> --local ${localTarget.port}${hostFlag}`,
+    );
+  }
   return lines.join('\n');
 }
 

@@ -318,6 +318,7 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
       fetchImpl: deps.fetchImpl ?? createDryRunFetch(),
       onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDryRunDebug(event)) : undefined,
       onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
+      env,
       requestTimeoutMs,
       shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
     };
@@ -354,6 +355,7 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
         dryRun: opts.dryRun,
         stderr,
       }),
+    env,
     requestTimeoutMs,
     shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
   };

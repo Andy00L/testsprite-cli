@@ -42,6 +42,7 @@ import type {
   RerunAdvisory,
   RerunClosure,
   RerunResponse,
+  RunEnvironmentRef,
   RunResponse,
   RunSource,
   RunStatus,
@@ -63,6 +64,18 @@ function openWireLiteral<TLiteral extends string>(): v.GenericSchema<unknown, TL
   return v.custom<TLiteral>(value => typeof value === 'string');
 }
 
+/**
+ * Mirrors `RunEnvironmentRef` (runs.types.ts): the environment a run resolved to.
+ * Optional + nullable everywhere it appears: absent on an older backend, `null`
+ * when the row carries no stamp — both mean "unknown" to every renderer.
+ */
+const RUN_ENVIRONMENT_REF_SCHEMA: v.GenericSchema<unknown, RunEnvironmentRef> = v.looseObject({
+  // Either half may be null: a backfilled row whose environment was deleted
+  // keeps the denormalised name but no id, and a pre-name row keeps the id only.
+  id: v.nullable(v.string()),
+  name: v.nullable(v.string()),
+});
+const OPTIONAL_ENVIRONMENT_SCHEMA = v.optional(v.nullable(RUN_ENVIRONMENT_REF_SCHEMA));
 // ---------------------------------------------------------------------------
 // GET /runs/{runId}
 // ---------------------------------------------------------------------------
@@ -109,6 +122,8 @@ export const RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RunResponse> = v.loos
   // when either is null (rule 3).
   codeVersion: v.nullish(v.string(), null),
   targetUrl: v.nullish(v.string(), null),
+  // The run's environment — optional with no default (rule 3, optional branch).
+  environment: OPTIONAL_ENVIRONMENT_SCHEMA,
   createdFrom: v.nullish(v.string(), null),
   failedStepIndex: v.nullish(v.number(), null),
   failureKind: v.nullish(v.string(), null),
@@ -189,6 +204,8 @@ export const TRIGGER_RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, TriggerRunRes
     enqueuedAt: v.string(),
     codeVersion: v.string(),
     targetUrl: v.string(),
+    // The run's environment — optional with no default (rule 3, optional branch).
+    environment: OPTIONAL_ENVIRONMENT_SCHEMA,
     // Server-built portal links (backend ≥ the run-links change). Optional
     // with no default (rule 3): an older backend omits them, and a V3 run
     // the server could not link stays ABSENT — the renderer prints a
@@ -361,6 +378,8 @@ const RUN_HISTORY_ITEM_SCHEMA = v.looseObject({
   // G1b fields: optional on the wire for back-compat with older backends.
   targetUrl: v.optional(v.nullable(v.string())),
   targetUrlSource: v.optional(v.nullable(openWireLiteral<'run' | 'unresolved'>())),
+  // The run's environment — optional with no default.
+  environment: OPTIONAL_ENVIRONMENT_SCHEMA,
 });
 
 /** Mirrors `ListRunsResponse` (runs.types.ts): `GET /tests/{testId}/runs`. */

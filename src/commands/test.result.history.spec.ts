@@ -1749,3 +1749,99 @@ describe('empty latest steps history hint', () => {
     expect(help).not.toContain('cumulative');
   });
 });
+
+// ---------------------------------------------------------------------------
+// DEV-1306 — environment on the history surface
+// ---------------------------------------------------------------------------
+
+describe('runResultHistory — environment (DEV-1306)', () => {
+  const common = { profile: 'default', dryRun: false, debug: false, verbose: false } as const;
+
+  it('renders an ENV column: the environment name, or — when the row names none', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    const fetchImpl = makeFetch(url =>
+      url.includes('/tests/test_abc/runs')
+        ? {
+            body: makeHistoryResp([
+              makeHistoryItem({
+                runId: 'run_env',
+                environment: { id: 'env_demo', name: 'demo' },
+                targetUrl: 'https://demo.example.com',
+                targetUrlSource: null,
+              }),
+              makeHistoryItem({
+                runId: 'run_local',
+                environment: { id: 'env_local', name: 'local-dev' },
+                targetUrl: 'http://127.0.0.1:55015',
+                targetUrlSource: null,
+              }),
+              makeHistoryItem({ runId: 'run_old' }),
+            ]),
+          }
+        : { status: 404, body: errorEnvelope('NOT_FOUND') },
+    );
+    await runResultHistory(
+      { ...common, output: 'text', testId: 'test_abc' },
+      { credentialsPath, fetchImpl, stdout: line => lines.push(line) },
+    );
+    const output = lines.join('\n');
+    expect(output).toMatch(/RUN ID\s+STATUS\s+SOURCE\s+ENV\s+RERUN\?/);
+    expect(output).toMatch(/run_env\s+passed\s+cli\s+demo\s+/);
+    // A run on a developer-machine environment is just that environment's
+    // name: the address it went to is the environment's own, so there is no
+    // second kind of row and nothing about credentials to add below it.
+    expect(output).toMatch(/run_local\s+passed\s+cli\s+local-dev\s+/);
+    expect(output).toMatch(/run_old\s+passed\s+cli\s+—\s+/);
+    expect(output).toContain('targetUrl: http://127.0.0.1:55015\n');
+    expect(output).toContain('targetUrl: https://demo.example.com\n');
+  });
+
+  it('--env forwards ?environment=<name> to the server', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: makeHistoryResp([]) };
+    });
+    await runResultHistory(
+      { ...common, output: 'json', testId: 'test_abc', environment: 'local-dev' },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(seen).toHaveLength(1);
+    expect(new URL(seen[0]!).searchParams.get('environment')).toBe('local-dev');
+  });
+
+  it('a whitespace-only --env is refused locally', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    await expect(
+      runResultHistory(
+        { ...common, output: 'json', testId: 'test_abc', environment: ' ' },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(url => {
+            seen.push(url);
+            return { body: makeHistoryResp([]) };
+          }),
+          stdout: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    expect(seen).toEqual([]);
+  });
+
+  it('`test result <id> --env x` without --history is a validation error (exit 5)', async () => {
+    const test = createTestCommand();
+    const disable = (c: { exitOverride: () => unknown; commands: Array<unknown> }) => {
+      c.exitOverride();
+      (c.commands as Array<{ exitOverride: () => unknown; commands: Array<unknown> }>).forEach(
+        disable,
+      );
+    };
+    disable(test as never);
+    await expect(
+      test.parseAsync(['result', 'test_abc', '--env', 'demo'], { from: 'user' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});

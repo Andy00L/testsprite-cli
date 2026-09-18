@@ -236,6 +236,9 @@ Commands:
                                      injected into every backend test.
   docs                               Manage project documents — the sources
                                      plan generation feeds on
+  env                                Manage a project's environments — named
+                                     URL + test-account bundles that \`test run
+                                     --env <name>\` selects
   help [command]                     display help for command
 "
 `;
@@ -416,8 +419,8 @@ Commands:
     0  passed (or queued without --wait)
     1  failed / blocked / cancelled
     3  auth error
-    4  test not found
-    5  validation error
+    4  test not found (single), or batch: nothing queued — every id had no replayable run
+    5  validation error, or --all resolved zero tests (pass --allow-empty to exit 0)
     6  conflict (already running — see nextAction for the active runId)
     7  timeout or deferred — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
    11  rate limited — honor Retry-After
@@ -566,7 +569,7 @@ Options:
 Plan file format (--plan-from <file>) — minimal valid example:
 
 {
-  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.11.0/schemas/plan.schema.json",
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.12.0/schemas/plan.schema.json",
   "projectId": "prj_abc123",
   "type": "frontend",
   "name": "Login rejects an empty password",
@@ -837,8 +840,8 @@ Exit codes:
   0  passed (or queued without --wait)
   1  failed / blocked / cancelled
   3  auth error
-  4  test not found
-  5  validation error
+  4  test not found (single), or batch: nothing queued — every id had no replayable run
+  5  validation error, or --all resolved zero tests (pass --allow-empty to exit 0)
   6  conflict (already running — see nextAction for the active runId)
   7  timeout or deferred — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
  11  rate limited — honor Retry-After
@@ -873,6 +876,12 @@ Options:
   --skip-dependencies         BE only: rerun only the named test without
                               expanding the producer/teardown closure (default:
                               false)
+  --env <name>                replay against the named project environment —
+                              its test-account credentials, auto-auth and OTP
+                              settings (names: \`testsprite project env list
+                              <project-id>\`). Omit to keep using the project's
+                              default environment. Applies to every test of a
+                              batch rerun.
   --max-concurrency <n>       with --wait, max in-flight polls at once (1-100,
                               default: 50)
   --idempotency-key <key>     opaque key for safe retries (1–256 chars).
@@ -883,12 +892,18 @@ Options:
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
                               (default: testsprite:<projectId>)
   --gh-output                 with batch --wait: emit GitHub-native output
-                              (::error:: annotations per non-passed run;
+                              (::error:: annotations for failed/timed-out runs,
+                              ::warning:: for never-dispatched tests;
                               job-summary table when $GITHUB_STEP_SUMMARY is
                               set). Auto-enabled when GITHUB_ACTIONS=true
   --summary-file <path>       with batch --wait: also write the reduced machine
-                              summary JSON {total, passed, failed, timedOut,
-                              runs[]} to this file
+                              summary JSON {total, passed, failed, skipped,
+                              timedOut, runs[]} to this file
+  --allow-empty               with --all: exit 0 when the resolved test set is
+                              empty (no tests match
+                              --filter/--status/--skip-terminal, or the project
+                              has none). Default: fail with exit 5 — a
+                              zero-dispatch rerun is a CI false-green
   -h, --help                  display help for command
 
 Notes:
@@ -939,6 +954,8 @@ Options:
   --cursor <token>    with --history: opaque cursor from a prior page
   --rerun             with --history: show only reruns
   --no-rerun          with --history: show only fresh (non-rerun) runs
+  --env <name>        with --history: only runs whose credentials came from
+                      this project environment
   --columns <list>    with --history: select/reorder text table columns
   --no-header         with --history: suppress the text table header row
   -h, --help          display help for command
@@ -1019,6 +1036,15 @@ Options:
                               tunnel's owner disappears. An ordinary interrupt
                               of a borrowed run never cancels it because its
                               tunnel remains alive.
+  --env <name>                run against the named project environment — its
+                              test-account credentials, auto-auth and OTP
+                              settings (names: \`testsprite project env list
+                              <project-id>\`). Combine with --local to use those
+                              credentials against your own machine, or with
+                              --target-url against another address; without
+                              either, the run opens that environment's URL.
+                              Omit --env to keep using the project's default
+                              environment. Also applies with --all.
   --wait                      poll until terminal status or --timeout elapses
                               (default: false)
   --timeout <s>               with --wait, max seconds to wait (1–3600; default
@@ -1042,13 +1068,14 @@ Options:
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
                               (default: testsprite:<projectId>)
   --gh-output                 with --wait (single test or --all): emit
-                              GitHub-native output (::error:: annotations per
-                              non-passed run; job-summary table when
+                              GitHub-native output (::error:: annotations for
+                              failed/timed-out runs, ::warning:: for
+                              never-dispatched tests; job-summary table when
                               $GITHUB_STEP_SUMMARY is set). Auto-enabled when
                               GITHUB_ACTIONS=true
   --summary-file <path>       with --wait (single test or --all): also write
                               the reduced machine summary JSON {total, passed,
-                              failed, timedOut, runs[]} to this file
+                              failed, skipped, timedOut, runs[]} to this file
   --allow-empty               with --all: exit 0 when the run dispatches ZERO
                               tests (all skipped / empty project / --filter
                               matched nothing). Default: fail with exit 5 — a
@@ -1223,12 +1250,13 @@ Options:
   --report-suite-name <name>  JUnit <testsuite name=...> override (default:
                               testsprite:testlist:<listId>)
   --gh-output                 with --wait: emit GitHub-native output (::error::
-                              annotations per non-passed member; job-summary
-                              table when $GITHUB_STEP_SUMMARY is set).
-                              Auto-enabled when GITHUB_ACTIONS=true
+                              annotations for failed/timed-out members,
+                              ::warning:: for never-dispatched ones;
+                              job-summary table when $GITHUB_STEP_SUMMARY is
+                              set). Auto-enabled when GITHUB_ACTIONS=true
   --summary-file <path>       with --wait: also write the reduced machine
-                              summary JSON {total, passed, failed, timedOut,
-                              runs[]} to this file
+                              summary JSON {total, passed, failed, skipped,
+                              timedOut, runs[]} to this file
   -h, --help                  display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):

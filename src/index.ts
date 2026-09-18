@@ -20,7 +20,13 @@ import { createTestCommand, type TunnelInterruptDetach } from './commands/test.j
 import { createTestListCommand } from './commands/testlist.js';
 import { createUsageCommand } from './commands/usage.js';
 import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
-import { ApiError, CLIError, InterruptError, RequestTimeoutError } from './lib/errors.js';
+import {
+  ApiError,
+  CLIError,
+  InterruptError,
+  RequestTimeoutError,
+  extractNodeErrorCode,
+} from './lib/errors.js';
 import { installBrokenPipeGuard, installSignalHandlers } from './lib/interrupt.js';
 import { Output, isOutputMode } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
@@ -392,6 +398,8 @@ try {
           outcome: telemetryOutcome.outcome,
           exitCode: telemetryOutcome.exitCode,
           errorCode: telemetryOutcome.errorCode,
+          errorOrigin: telemetryOutcome.errorOrigin,
+          timeoutSeconds: telemetryOutcome.timeoutSeconds,
           ...waitTimeoutTelemetry,
           durationMs: Date.now() - telemetryStartedAt,
           ...telemetryGlobals(),
@@ -551,10 +559,18 @@ try {
       await flushThenSetExitCode(5);
     }
   } else if (err instanceof CLIError) {
-    output.error(err.message);
+    // Same 5-key envelope shape as the ApiError/InterruptError/
+    // RequestTimeoutError branches above — `err.code` defaults to the
+    // out-of-catalog 'CLI_ERROR' bucket for a plain CLIError (see errors.ts).
+    output.error({ code: err.code, message: err.message });
     await flushThenSetExitCode(err.exitCode);
   } else {
-    output.error(err instanceof Error ? err.message : String(err));
+    // Genuinely uncaught, non-CLIError exception. Prefer a real Node error
+    // code (ENOENT, ECONNREFUSED, …) when one is present; otherwise fall
+    // back to the same 'UNCAUGHT_EXCEPTION' bucket classifyCliError() uses,
+    // so the JSON envelope's code and the telemetry errorCode always agree.
+    const message = err instanceof Error ? err.message : String(err);
+    output.error({ code: extractNodeErrorCode(err) ?? 'UNCAUGHT_EXCEPTION', message });
     await flushThenSetExitCode(1);
   }
 }

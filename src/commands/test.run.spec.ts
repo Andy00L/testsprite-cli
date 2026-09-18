@@ -15,6 +15,7 @@ import { ShutdownController } from '../lib/interrupt.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { RunResponse, TriggerRunResponse, BatchRunFreshResponse } from '../lib/runs.types.js';
+import { takeTelemetryExtras } from '../lib/telemetry.js';
 import { runTestRun, runTestRunAll } from './test.js';
 
 // ---------------------------------------------------------------------------
@@ -4296,7 +4297,7 @@ describe('runTestRunAll — --max-concurrency validation', () => {
           timeoutSeconds: 600,
           maxConcurrency: 100,
           // This case only asserts --max-concurrency=100 is accepted; the empty
-          // batch would otherwise trip the DEV-1046 zero-dispatch failure.
+          // batch would otherwise trip the zero-dispatch failure.
           allowEmpty: true,
         },
         {
@@ -4312,12 +4313,12 @@ describe('runTestRunAll — --max-concurrency validation', () => {
 });
 
 // ---------------------------------------------------------------------------
-// DEV-1046: `test run --all` that dispatches ZERO tests must not exit 0 (a CI
+// `test run --all` that dispatches ZERO tests must not exit 0 (a CI
 // false-green). It fails with exit 5 and still emits summary / annotation /
 // JUnit, unless --allow-empty is set.
 // ---------------------------------------------------------------------------
 
-describe('runTestRunAll — zero-dispatch fails the CI gate (DEV-1046)', () => {
+describe('runTestRunAll — zero-dispatch fails the CI gate', () => {
   const EMPTY_BATCH: BatchRunFreshResponse = {
     accepted: [],
     conflicts: [],
@@ -4464,12 +4465,17 @@ describe('runTestRunAll — zero-dispatch fails the CI gate (DEV-1046)', () => {
         sleep: () => Promise.resolve(),
       }),
     ).rejects.toMatchObject({ exitCode: 5 });
-    // The `::error::` annotation lands (the "show WHY" half), on either stream.
-    expect(out.some(l => l.startsWith('::error'))).toBe(true);
-    // The machine summary is written and gate-red (0 passed, ≥1 non-passed row).
+    // The annotation lands (the "show WHY" half), on either stream — a
+    // ::warning::, since the rows never dispatched (severity split);
+    // the exit-5 above is what makes the job red.
+    expect(out.some(l => l.startsWith('::warning'))).toBe(true);
+    // The machine summary is written and gate-consistent: 0 passed, the
+    // never-dispatched rows counted as skipped (not failed).
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- summaryFile is a mkdtempSync path in this test's own temp dir.
     const summary = JSON.parse(readFileSync(summaryFile, 'utf8'));
     expect(summary.passed).toBe(0);
+    expect(summary.failed).toBe(0);
+    expect(summary.skipped).toBeGreaterThan(0);
     expect(summary.runs.length).toBeGreaterThan(0);
   });
 
@@ -5112,14 +5118,17 @@ describe('gh-output integration on run --all --wait (issue #99 reshape)', () => 
       total: number;
       passed: number;
       failed: number;
+      skipped: number;
       runs: { testId: string; status: string }[];
     };
-    expect(artifact).toMatchObject({ total: 1, passed: 0, failed: 1 });
+    // The conflict row counts as skipped, not failed: nothing ran,
+    // and the exit-6 above is the failure signal the artifact must agree with.
+    expect(artifact).toMatchObject({ total: 1, passed: 0, failed: 0, skipped: 1 });
     expect(artifact.runs.some(r => r.testId === 'test_be_01' && r.status === 'conflict')).toBe(
       true,
     );
     expect(
-      stdoutLines.some(line => line.startsWith('::error') && line.includes('test_be_01')),
+      stdoutLines.some(line => line.startsWith('::warning') && line.includes('test_be_01')),
     ).toBe(true);
   });
 });
@@ -5760,4 +5769,630 @@ describe('early run receipt', () => {
       expect(stdout).toEqual([JSON.stringify(response, null, 2)]);
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// Billing refusals on the batch surface + per-command telemetry facts
+// ---------------------------------------------------------------------------
+
+describe('runTestRunAll — insufficient credits → exit 12 (single-run parity)', () => {
+  beforeEach(() => {
+    takeTelemetryExtras();
+  });
+  afterEach(() => {
+    takeTelemetryExtras();
+  });
+
+  const batchOpts = {
+    profile: 'default',
+    output: 'json' as const,
+    debug: false,
+    projectId: 'project_be',
+    timeoutSeconds: 60,
+    maxConcurrency: 10,
+  };
+
+  /** The server's own answer when NOTHING dispatched and every refusal was credits. */
+  const CREDITS_402 = {
+    status: 402,
+    body: {
+      error: {
+        code: 'INSUFFICIENT_CREDITS',
+        message: 'Insufficient credits: this run needs 2 credits, you have 0.',
+        nextAction: 'Top up credits on the portal Billing page.',
+        requestId: 'req_402',
+        details: { required: 2 },
+      },
+    },
+  };
+
+  it('--wait: a 402 INSUFFICIENT_CREDITS envelope from the batch route exits 12 with the credits nextAction, not 6', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return CREDITS_402;
+      return { body: { items: [], nextToken: null } };
+    });
+    const err = (await runTestRunAll(
+      { ...batchOpts, wait: true },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.code).toBe('INSUFFICIENT_CREDITS');
+    expect(err.exitCode).toBe(12);
+    expect(err.message).toContain('Insufficient credits');
+    expect(err.nextAction).toBe('Top up credits on the portal Billing page.');
+    expect(err.requestId).toBe('req_402');
+  });
+
+  const ALL_CREDITS_CONFLICTS: BatchRunFreshResponse = {
+    accepted: [],
+    conflicts: [
+      {
+        testId: 'test_be_01',
+        reason: 'insufficient_credits',
+        message: 'Insufficient credits: need 2, have 0.',
+      },
+      { testId: 'test_be_02', reason: 'insufficient_credits' },
+    ],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+
+  it.each([false, true])(
+    'wait=%s: zero accepted + zero deferred + every conflict insufficient_credits → exit 12 with the server message',
+    async wait => {
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = makeFetch((_url, init) => {
+        if ((init.method ?? 'GET') === 'POST') return { body: ALL_CREDITS_CONFLICTS };
+        return { body: { items: [], nextToken: null } };
+      });
+      const err = (await runTestRunAll(
+        { ...batchOpts, wait },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          sleep: instantSleep,
+        },
+      ).catch(e => e)) as ApiError;
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err.code).toBe('INSUFFICIENT_CREDITS');
+      expect(err.exitCode).toBe(12);
+      expect(err.message).toBe('Insufficient credits: need 2, have 0.');
+      expect(err.nextAction).toContain('/dashboard/settings/billing');
+      expect(err.details).toEqual({
+        reason: 'insufficient_credits',
+        conflicts: ['test_be_01', 'test_be_02'],
+      });
+      // The batch accounting still lands on telemetry for the failed invocation.
+      expect(takeTelemetryExtras()).toMatchObject({
+        accepted: 0,
+        conflicts: 2,
+        deferred: 0,
+        skipped: 0,
+        conflictReason: 'insufficient_credits',
+      });
+    },
+  );
+
+  it('a MIXED conflict set (credits + in-flight) keeps the all-conflict CONFLICT exit 6', async () => {
+    const { credentialsPath } = makeCreds();
+    const mixed: BatchRunFreshResponse = {
+      ...ALL_CREDITS_CONFLICTS,
+      conflicts: [
+        { testId: 'test_be_01', reason: 'insufficient_credits' },
+        { testId: 'test_be_02' }, // legacy shape: in flight
+      ],
+    };
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: mixed };
+      return { body: { items: [], nextToken: null } };
+    });
+    const err = (await runTestRunAll(
+      { ...batchOpts, wait: false },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as ApiError;
+    expect(err.code).toBe('CONFLICT');
+    expect(err.exitCode).toBe(6);
+  });
+
+  it('a credits conflict beside an accepted run is a hard conflict after the poll: exit 6, not 12', async () => {
+    const { credentialsPath } = makeCreds();
+    const partial: BatchRunFreshResponse = {
+      accepted: [{ testId: 'test_be_01', runId: 'run_ok', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
+      conflicts: [{ testId: 'test_be_02', reason: 'insufficient_credits' }],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: partial };
+      if (url.includes('/runs/run_ok')) {
+        return { body: { ...makePassedRun(), runId: 'run_ok', testId: 'test_be_01' } };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    const err = (await runTestRunAll(
+      { ...batchOpts, wait: true },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as ApiError;
+    expect(err.code).toBe('CONFLICT');
+    expect(err.exitCode).toBe(6);
+    expect(takeTelemetryExtras()).toEqual({
+      accepted: 1,
+      conflicts: 1,
+      deferred: 0,
+      skipped: 0,
+      conflictReason: 'insufficient_credits',
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      timedOut: 0,
+    });
+  });
+});
+
+describe('telemetry extras recorded by the run commands', () => {
+  beforeEach(() => {
+    takeTelemetryExtras();
+  });
+  afterEach(() => {
+    takeTelemetryExtras();
+  });
+
+  it('test run --all --wait records dispatch counts + disjoint verdict counts', async () => {
+    const { credentialsPath } = makeCreds();
+    const resp: BatchRunFreshResponse = {
+      accepted: [
+        { testId: 't1', runId: 'run_p', enqueuedAt: '2026-06-09T10:00:00.000Z' },
+        { testId: 't2', runId: 'run_b', enqueuedAt: '2026-06-09T10:00:01.000Z' },
+      ],
+      conflicts: [{ testId: 't3', currentRunId: undefined, reason: 'mcp_view_only' }],
+      deferred: [],
+      skippedFrontend: ['fe1'],
+      skippedIntegration: [{ testId: 'int1' }],
+    };
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: resp };
+      if (url.includes('/runs/run_p')) {
+        return { body: { ...makePassedRun(), runId: 'run_p', testId: 't1' } };
+      }
+      if (url.includes('/runs/run_b')) {
+        return { body: { ...makePassedRun(), runId: 'run_b', testId: 't2', status: 'blocked' } };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 10,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(() => undefined); // blocked → exit 1 (+ hard conflict → 6); the facts are what's under test
+    expect(takeTelemetryExtras()).toEqual({
+      accepted: 2,
+      conflicts: 1,
+      deferred: 0,
+      skipped: 2,
+      conflictReason: 'mcp_view_only',
+      passed: 1,
+      failed: 0,
+      blocked: 1,
+      timedOut: 0,
+    });
+  });
+
+  it('test run --all (no --wait) records dispatch counts only', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') {
+        return {
+          body: {
+            accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
+            conflicts: [],
+            deferred: [{ testId: 't2' }],
+            skippedFrontend: [],
+            skippedIntegration: [],
+          } satisfies BatchRunFreshResponse,
+        };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: false,
+        timeoutSeconds: 60,
+        maxConcurrency: 10,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(() => undefined); // deferred → exit 7
+    expect(takeTelemetryExtras()).toEqual({ accepted: 1, conflicts: 0, deferred: 1, skipped: 0 });
+  });
+
+  it('test run <id> --wait records the one-run verdict as 0/1 counts', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
+        return { body: TRIGGER_RESP };
+      }
+      return { body: makePassedRun() };
+    });
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    );
+    expect(takeTelemetryExtras()).toEqual({ passed: 1, failed: 0, blocked: 0, timedOut: 0 });
+  });
+
+  it('test run <id> --wait on a --timeout records timedOut: 1', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
+        return { body: TRIGGER_RESP };
+      }
+      return { body: { ...makePassedRun(), status: 'running' as const } };
+    });
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(() => undefined); // exit 7
+    expect(takeTelemetryExtras()).toEqual({ passed: 0, failed: 0, blocked: 0, timedOut: 1 });
+  });
+});
+
+describe('runTestRunAll — billing hold on the batch route', () => {
+  beforeEach(() => {
+    takeTelemetryExtras();
+  });
+  afterEach(() => {
+    takeTelemetryExtras();
+  });
+
+  const batchOpts = {
+    profile: 'default',
+    output: 'json' as const,
+    debug: false,
+    projectId: 'project_be',
+    timeoutSeconds: 60,
+    maxConcurrency: 10,
+  };
+
+  /** The server's answer when the WHOLE batch is refused for a billing hold —
+   * the same 403 FEATURE_GATED envelope the single-run route returns. */
+  const HOLD_403 = {
+    status: 403,
+    body: {
+      error: {
+        code: 'FEATURE_GATED',
+        message: 'Billing hold: this workspace cannot start new runs until payment is resolved.',
+        nextAction: 'Resolve the payment on the billing page, then retry.',
+        requestId: 'req_403',
+        details: { reason: 'billing_hold', state: 'unpaid' },
+      },
+    },
+  };
+
+  it('--wait: a 403 FEATURE_GATED envelope from the batch route exits 13 with the envelope nextAction', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return HOLD_403;
+      return { body: { items: [], nextToken: null } };
+    });
+    const err = (await runTestRunAll(
+      { ...batchOpts, wait: true },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.exitCode).toBe(13);
+    expect(err.message).toContain('Billing hold');
+    expect(err.nextAction).toBe('Resolve the payment on the billing page, then retry.');
+    expect(err.requestId).toBe('req_403');
+    expect(err.getDetail('reason')).toBe('billing_hold');
+    expect(err.getDetail('state')).toBe('unpaid');
+  });
+
+  it('defensive fallback: an older backend folding every case into billing_hold conflicts keeps exit 6', async () => {
+    const { credentialsPath } = makeCreds();
+    const allHold: BatchRunFreshResponse = {
+      accepted: [],
+      conflicts: [
+        { testId: 'test_be_01', reason: 'billing_hold', message: 'Billing hold.' },
+        { testId: 'test_be_02', reason: 'billing_hold' },
+      ],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: allHold };
+      return { body: { items: [], nextToken: null } };
+    });
+    const stderrLines: string[] = [];
+    const err = (await runTestRunAll(
+      { ...batchOpts, wait: true },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as ApiError;
+    expect(err.code).toBe('CONFLICT');
+    expect(err.exitCode).toBe(6);
+    // The cause is still named on stderr, not blanket "already in flight".
+    expect(stderrLines.join('\n')).toContain('2 billing hold');
+    expect(takeTelemetryExtras()).toMatchObject({ conflicts: 2, conflictReason: 'billing_hold' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-1305 — `--env <name>`: a named environment on the run surfaces
+// ---------------------------------------------------------------------------
+
+describe('test run --env (DEV-1305)', () => {
+  const ME_ON = { userId: 'u_1', keyId: 'k_1', scopes: [], env: 'development' };
+
+  interface Seen {
+    method: string;
+    url: string;
+    body: unknown;
+  }
+
+  function recordingFetch(me: unknown, seen: Seen[]): typeof globalThis.fetch {
+    return makeFetch((url, init) => {
+      const method = (init.method ?? 'GET').toUpperCase();
+      const body =
+        init.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      seen.push({ method, url, body });
+      if (url.endsWith('/me')) return { body: me };
+      if (url.includes('/tests/batch/run')) {
+        return {
+          body: {
+            accepted: [
+              { testId: 'test_xyz', runId: 'run_abc', enqueuedAt: '2026-09-09T00:00:00.000Z' },
+            ],
+            conflicts: [],
+            deferred: [],
+            skippedFrontend: [],
+            skippedIntegration: [],
+          },
+        };
+      }
+      return { body: TRIGGER_RESP };
+    });
+  }
+
+  it('run and rerun expose --env (long flag only, no -e)', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const test = createTestCommand();
+    for (const name of ['run', 'rerun']) {
+      const cmd = test.commands.find(c => c.name() === name)!;
+      const env = cmd.options.find(o => o.long === '--env');
+      expect(env).toBeDefined();
+      expect(env!.short).toBeUndefined();
+    }
+  });
+
+  it('sends `environment` in the trigger body, with no capability probe first', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: Seen[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        environment: 'staging',
+      },
+      {
+        credentialsPath,
+        fetchImpl: recordingFetch(ME_ON, seen),
+        stdout: () => {},
+        sleep: instantSleep,
+      },
+    );
+    const trigger = seen.find(s => s.method === 'POST' && s.url.includes('/tests/test_xyz/runs'));
+    expect(trigger?.body).toEqual({ source: 'cli', environment: 'staging' });
+    // Naming an environment is an ordinary argument, not a privilege. The
+    // request goes straight out; whether the name resolves is the server's
+    // answer to give, and a round trip asking permission first would only add
+    // a second place for the CLI and the server to disagree.
+    expect(seen.filter(s => s.url.endsWith('/me'))).toEqual([]);
+  });
+
+  it('does not touch /me when --env is absent (byte-identical to today)', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: Seen[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: recordingFetch(ME_ON, seen),
+        stdout: () => {},
+        sleep: instantSleep,
+      },
+    );
+    expect(seen.some(s => s.url.endsWith('/me'))).toBe(false);
+    const trigger = seen.find(s => s.method === 'POST');
+    expect(trigger?.body).toEqual({ source: 'cli' });
+  });
+
+  it('a whitespace-only --env is a validation error before any network call', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: Seen[] = [];
+    await expect(
+      runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          testId: 'test_xyz',
+          wait: false,
+          timeoutSeconds: 60,
+          environment: '   ',
+        },
+        {
+          credentialsPath,
+          fetchImpl: recordingFetch(ME_ON, seen),
+          stdout: () => {},
+          sleep: instantSleep,
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(seen).toEqual([]);
+  });
+
+  it('--all: `environment` rides on the batch body too', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: Seen[] = [];
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        projectId: 'project_1',
+        wait: false,
+        timeoutSeconds: 60,
+        maxConcurrency: 10,
+        environment: 'staging',
+      },
+      {
+        credentialsPath,
+        fetchImpl: recordingFetch(ME_ON, seen),
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    const batch = seen.find(s => s.method === 'POST' && s.url.includes('/tests/batch/run'));
+    expect(batch?.body).toEqual({ projectId: 'project_1', source: 'cli', environment: 'staging' });
+    expect(seen.filter(s => s.url.endsWith('/me'))).toEqual([]);
+  });
+
+  it('renders the environment line on the trigger card when the server reports one', async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        environment: 'local-dev',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(url =>
+          url.endsWith('/me')
+            ? { body: ME_ON }
+            : {
+                body: {
+                  ...TRIGGER_RESP,
+                  targetUrl: 'http://127.0.0.1:55015',
+                  environment: { id: 'env_1', name: 'local-dev' },
+                },
+              },
+        ),
+        stdout: l => out.push(l),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    const text = out.join('\n');
+    expect(text).toContain('environment local-dev');
+    expect(text).toContain('targetUrl   http://127.0.0.1:55015');
+  });
 });

@@ -232,6 +232,8 @@ describe('createTestCommand — surface', () => {
       '--cursor',
       '--rerun',
       '--no-rerun',
+      // DEV-1306: filter history by the credentials-supplying environment.
+      '--env',
       '--columns',
       '--no-header',
     ]);

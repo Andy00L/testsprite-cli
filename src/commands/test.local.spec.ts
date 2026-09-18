@@ -2352,3 +2352,54 @@ describe('local wait timeout telemetry', () => {
     },
   );
 });
+
+// ---------------------------------------------------------------------------
+// DEV-1305 — `--local <port> --env <name>`: the tunnel supplies the address, the
+// environment supplies the credentials.
+// ---------------------------------------------------------------------------
+
+describe('test run --local --env (DEV-1305)', () => {
+  it('sends targetUrl + tunnelClientId + environment together on the trigger', async () => {
+    const port = 5173;
+    const calls: Call[] = [];
+    const tunnel = fakeTunnel();
+    const target = `http://127.0.0.1:${port}`;
+
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: port,
+        localHost: '127.0.0.1',
+        wait: true,
+        timeoutSeconds: 30,
+        skipPreflight: true,
+        environment: 'local-dev',
+      },
+      {
+        ...makeCreds(),
+        fetchImpl: makeRecordingFetch({ calls, targetUrl: target }),
+        stderr: () => {},
+        stdout: () => {},
+        sleep: async () => {},
+        createTunnelClient: tunnel.factory,
+      },
+    );
+
+    const trigger = calls.find(c => c.method === 'POST' && c.url.includes('/runs'));
+    expect(trigger?.body).toEqual({
+      source: 'cli',
+      targetUrl: target,
+      tunnelClientId: MINT_BODY.clientId,
+      environment: 'local-dev',
+    });
+    // A tunnel address and a named environment are two halves of one request,
+    // not two features that have to clear each other. Nothing is asked for
+    // permission first, so the mint is the first call that happens.
+    expect(calls.filter(c => c.url.endsWith('/me'))).toEqual([]);
+    expect(tunnel.calls.start).toBe(1);
+    expect(tunnel.calls.stop).toBe(1);
+  });
+});

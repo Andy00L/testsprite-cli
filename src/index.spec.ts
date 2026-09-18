@@ -146,20 +146,54 @@ describe('wait timeout telemetry through the entry point', () => {
       timeout: true,
     },
     { args: ['wait', 'run_abc'], local: false, timeout: true },
-    { args: ['wait', 'run_abc', 'run_other'], local: false, timeout: true },
+    // Multi-run `test wait <a> <b>` aggregates each member's own poll outcome
+    // and, when one or more members time out, throws a plain summary
+    // `CLIError` (see runMultiWait in commands/test.ts) — NOT the
+    // ApiError/UNSUPPORTED conversion the single-run/rerun/batch paths use.
+    // That's pre-existing, unrelated-to-this-patch behavior; the correct
+    // classification for it is `errorCode: 'CLI_ERROR'` (the CLIError base
+    // default) with no `timeoutSeconds` (a plain CLIError carries no details).
+    {
+      args: ['wait', 'run_abc', 'run_other'],
+      local: false,
+      timeout: true,
+      errorCode: 'CLI_ERROR',
+      expectTimeoutSeconds: false,
+    },
     { args: ['rerun', 'test_abc', '--wait'], local: false, timeout: true },
     { args: ['run', '--all', '--project', 'project_abc', '--wait'], local: false, timeout: true },
-    { args: ['rerun', '--all', '--project', 'project_abc', '--wait'], local: false, timeout: true },
+    // The batch-rerun "deferred/timed-out" summary throw (commands/test.ts,
+    // the combined `deferred.length > 0 || timedOut > 0` gate) builds its
+    // `details` from `deferredTestIds`/`timedOutRunIds` only — it does not
+    // (today) also echo `opts.timeoutSeconds`. Still a client-fabricated
+    // UNSUPPORTED (requestId: 'local', no httpStatus), just without that one
+    // optional detail.
+    {
+      args: ['rerun', '--all', '--project', 'project_abc', '--wait'],
+      local: false,
+      timeout: true,
+      expectTimeoutSeconds: false,
+    },
     {
       args: ['run', '--all', '--project', 'project_abc', '--wait'],
       local: false,
       timeout: true,
       lateConflict: true,
     },
-    { args: ['wait', 'run_abc', 'run_other'], local: false, timeout: true, rateDeadline: true },
+    {
+      args: ['wait', 'run_abc', 'run_other'],
+      local: false,
+      timeout: true,
+      rateDeadline: true,
+      errorCode: 'CLI_ERROR',
+      expectTimeoutSeconds: false,
+    },
     { args: ['run', 'test_abc', '--wait'], local: false, timeout: false },
   ])('reports a poll deadline for $args (timeout=$timeout)', async scenario => {
     const { args, local, timeout } = scenario;
+    const errorCode = 'errorCode' in scenario ? scenario.errorCode : 'UNSUPPORTED';
+    const expectTimeoutSeconds =
+      'expectTimeoutSeconds' in scenario ? scenario.expectTimeoutSeconds : true;
     const lateConflict = 'lateConflict' in scenario;
     const rateDeadline = 'rateDeadline' in scenario;
     vi.useFakeTimers();
@@ -266,8 +300,19 @@ describe('wait timeout telemetry through the entry point', () => {
         outcome: 'error',
         exitCode: 7,
         reason: 'wait_timeout',
+        // This is the headline proof for the UNSUPPORTED client/server fix
+        // — every one of these scenarios is a CLI-side --wait deadline
+        // (never a genuine backend 501), so errorOrigin must ALWAYS read
+        // 'client' regardless of which throw site produced the error
+        // (UNSUPPORTED for the single-run/rerun/batch paths, or a plain
+        // CLIError for multi-run `test wait`) — that's exactly the signal
+        // that resolves the client/server over-count in prod telemetry.
+        errorCode,
+        errorOrigin: 'client',
+        ...(expectTimeoutSeconds ? { timeoutSeconds: 1 } : {}),
         ...(local ? { local: true, cancelOutcome: 'skipped' } : {}),
       });
+      if (!expectTimeoutSeconds) expect(events[0]).not.toHaveProperty('timeoutSeconds');
       if (!local) expect(events[0]).not.toHaveProperty('cancelOutcome');
       expect(process.exitCode).toBe(7);
     } else {
@@ -276,5 +321,109 @@ describe('wait timeout telemetry through the entry point', () => {
       expect(events[0]).not.toHaveProperty('cancelOutcome');
     }
     expect(JSON.parse(stdout)).toBeTruthy();
+  });
+});
+
+// End-to-end proof that the plain-CLIError catch branch in
+// index.ts now emits the same structured {error:{code,message,...}} envelope
+// as the ApiError/InterruptError/RequestTimeoutError branches, instead of the
+// bare `{"error":"<message>"}` string `output.error()` used to produce.
+describe('CLIError branch renders a structured --output json envelope', () => {
+  it('`test wait` resolving to a failed run exits 1 with a full 5-key error envelope', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        if (url.includes('/runs/')) {
+          return new Response(
+            JSON.stringify({
+              runId: 'run_abc',
+              testId: 'test_abc',
+              projectId: 'project_abc',
+              userId: 'user_abc',
+              status: 'failed',
+              source: 'cli',
+              createdAt: '2026-09-09T00:00:00.000Z',
+              startedAt: '2026-09-09T00:00:01.000Z',
+              finishedAt: '2026-09-09T00:00:02.000Z',
+              codeVersion: 'v1',
+              targetUrl: 'https://example.com',
+              createdFrom: null,
+              failedStepIndex: null,
+              failureKind: null,
+              error: null,
+              videoUrl: null,
+              stepSummary: { total: 1, completed: 0, passedCount: 0, failedCount: 1 },
+            }),
+          );
+        }
+        return new Response(JSON.stringify({ type: 'frontend' }));
+      }),
+    );
+    process.argv = ['node', 'testsprite', 'test', 'wait', 'run_abc', '--output', 'json'];
+    await import('./index.js');
+    expect(process.exitCode).toBe(1);
+    const envelope = JSON.parse(stderr.slice(stderr.indexOf('{')));
+    expect(envelope).toEqual({
+      error: {
+        code: 'CLI_ERROR',
+        message: 'Run run_abc finished with status: failed',
+        nextAction: '',
+        requestId: 'local',
+        details: {},
+      },
+    });
+  });
+});
+
+// Proves the discriminator's OTHER half — a genuine backend 501
+// UNSUPPORTED response (real HTTP round trip, httpStatus set) must report
+// errorOrigin: 'server', so it stays distinguishable from the client-side
+// --wait-timeout→UNSUPPORTED conversions covered above.
+describe('errorOrigin telemetry — server counterpart', () => {
+  it('a real backend 501 UNSUPPORTED response reports errorOrigin: server', async () => {
+    vi.stubEnv('TESTSPRITE_NO_TELEMETRY', '0');
+    vi.stubEnv('DO_NOT_TRACK', '0');
+    const events: unknown[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith('/telemetry')) {
+          events.push(JSON.parse(String(init?.body)));
+          return new Response(null, { status: 204 });
+        }
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'UNSUPPORTED',
+              message: 'Original backend message',
+              nextAction: 'Original next action',
+              requestId: 'request-backend-501',
+              details: { reason: 'another-unsupported-feature' },
+            },
+          }),
+          { status: 501 },
+        );
+      }),
+    );
+    process.argv = [
+      'node',
+      'testsprite',
+      'test',
+      'run',
+      'test_backend',
+      '--local',
+      '5173',
+      '--tunnel-client',
+      'borrowed-client',
+      '--skip-preflight',
+      '--output',
+      'json',
+    ];
+    await import('./index.js');
+    expect(process.exitCode).toBe(7);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ errorCode: 'UNSUPPORTED', errorOrigin: 'server' });
   });
 });

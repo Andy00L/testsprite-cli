@@ -29,7 +29,9 @@ or RFC1918 address, and not a general local-network escape hatch) to the test
 runner. Two constraints: frontend tests only (a backend test's target is baked
 into its generated code, so run it normally), and it needs an API key with the
 `run:tunnel` scope. Keys minted before that scope existed must be replaced;
-the CLI names the missing scope (exit 3).
+the CLI names the missing scope (exit 3). Add `--env <name>` to log in
+with a named project environment's test account instead of the default one's
+(`testsprite project env list <projectId>` shows the names).
 
 If the user explicitly named a tool (the CLI or the MCP), honor that choice
 regardless of which one the change's reachability would otherwise suggest.

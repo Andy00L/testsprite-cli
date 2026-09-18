@@ -261,6 +261,8 @@ without `--run`, then run its id with `--local`.
 ```bash
 # (a) existing test
 testsprite test run <test-id> --target-url <env-url> --wait --timeout 600 --output json
+# (a-env) same, logging in with a named project environment's test account (see `project env list`)
+testsprite test run <test-id> --env <env-name> --wait --timeout 600 --output json
 
 # (b-FE) new FE test from plan
 testsprite test create --plan-from plan.json --run --wait --target-url <env-url> --timeout 600

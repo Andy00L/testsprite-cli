@@ -447,3 +447,62 @@ describe('BATCH_RUN_FRESH_RESPONSE_SCHEMA — project-level dashboardUrl contrac
       );
   });
 });
+
+describe('DEV-1303 environment stamp — optional on every run-shaped payload', () => {
+  const HISTORY_ROW_BASE = {
+    runId: 'run_1',
+    status: 'passed',
+    source: 'cli',
+    isRerun: false,
+    createdFrom: null,
+    createdAt: '2026-06-01T10:00:00.000Z',
+    startedAt: null,
+    finishedAt: '2026-06-01T10:00:30.000Z',
+    codeVersion: 'v1',
+    failureKind: null,
+  };
+
+  it('history row: accepts environment, with a null targetUrlSource on a V3 row', () => {
+    const parsed = v.safeParse(LIST_RUNS_RESPONSE_SCHEMA, {
+      runs: [
+        {
+          ...HISTORY_ROW_BASE,
+          targetUrl: 'http://127.0.0.1:55015',
+          // V3: the environment IS the target — there is no separate provenance.
+          targetUrlSource: null,
+          environment: { id: 'env_1', name: 'local-dev' },
+        },
+        { ...HISTORY_ROW_BASE, environment: null },
+        HISTORY_ROW_BASE,
+      ],
+      nextCursor: null,
+      meta: {},
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.output.runs[0]!.environment).toEqual({ id: 'env_1', name: 'local-dev' });
+      expect(parsed.output.runs[1]!.environment).toBeNull();
+      // Absent stays absent — no default materialised.
+      expect('environment' in parsed.output.runs[2]!).toBe(false);
+    }
+  });
+
+  it('GET /runs/{id} and POST /runs accept `environment` and stay valid without it', () => {
+    const run = v.safeParse(RUN_RESPONSE_SCHEMA, {
+      ...VALID_RUN,
+      environment: { id: 'env_1', name: 'demo' },
+    });
+    expect(run.success).toBe(true);
+    expect(v.safeParse(RUN_RESPONSE_SCHEMA, VALID_RUN).success).toBe(true);
+
+    const trigger = v.safeParse(TRIGGER_RUN_RESPONSE_SCHEMA, {
+      runId: 'run_1',
+      status: 'queued',
+      enqueuedAt: '2026-06-01T10:00:00.000Z',
+      codeVersion: 'v1',
+      targetUrl: 'https://example.com',
+      environment: { id: 'env_1', name: 'demo' },
+    });
+    expect(trigger.success).toBe(true);
+  });
+});

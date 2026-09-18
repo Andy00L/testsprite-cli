@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as v from 'valibot';
 import type { ErrorCode } from './errors.js';
 import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
-import { VERSION } from '../version.js';
+import { buildUserAgent } from './client-tag.js';
 import {
   BATCH_RERUN_RESPONSE_SCHEMA,
   BATCH_RUN_FRESH_RESPONSE_SCHEMA,
@@ -103,6 +103,12 @@ export interface HttpClientOptions {
    * warn the user.
    */
   onServerVersion?: (info: { minVersion?: string }) => void;
+  /**
+   * Environment the client reads the optional `TESTSPRITE_CLIENT` tag from
+   * (see `client-tag.ts`) to build its User-Agent. Defaults to `process.env`;
+   * injectable so tests never depend on the developer's shell.
+   */
+  env?: NodeJS.ProcessEnv;
   /**
    * Per-request wall-clock timeout in milliseconds applied to every outgoing
    * fetch. The signal fires independently of any caller-supplied signal — the
@@ -281,11 +287,14 @@ export class HttpClient {
   private readonly requestTimeoutMs: number;
   private readonly shutdownSignal?: AbortSignal;
   private readonly maxResponseBytes: number;
+  private readonly userAgent: string;
 
   constructor(options: HttpClientOptions) {
     this.baseUrl = trimTrailingSlash(options.baseUrl);
     this.apiKey = options.apiKey;
     this.shutdownSignal = options.shutdownSignal;
+    // Resolved once: the tag is process-wide configuration, not per-request.
+    this.userAgent = buildUserAgent(options.env ?? process.env);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.sleep = options.sleep ?? defaultSleep;
     this.random = options.random ?? Math.random;
@@ -531,6 +540,7 @@ export class HttpClient {
     if (query.pageSize !== undefined) q.pageSize = query.pageSize;
     if (query.source !== undefined) q.source = query.source;
     if (query.since !== undefined) q.since = query.since;
+    if (query.environment !== undefined) q.environment = query.environment;
     return this.get<ListRunsResponse>(`/tests/${encodeURIComponent(testId)}/runs`, {
       query: q,
       signal: options.signal,
@@ -1074,7 +1084,7 @@ export class HttpClient {
     const headers: Record<string, string> = {
       'x-request-id': requestId,
       accept: 'application/json',
-      'user-agent': `testsprite-cli/${VERSION}`,
+      'user-agent': this.userAgent,
     };
     // The CLI v1 facade authenticates via `x-api-key`.
     // (securitySchemes.ApiKeyAuth). Sending only Authorization Bearer would be

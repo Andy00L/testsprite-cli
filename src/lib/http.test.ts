@@ -330,6 +330,38 @@ describe('HttpClient happy path', () => {
     await client.get('/me');
   });
 
+  it('appends a valid TESTSPRITE_CLIENT tag to the User-Agent', async () => {
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      expect(headers.get('user-agent')).toBe(`testsprite-cli/${VERSION} (github-action/v1)`);
+      return jsonResponse({});
+    });
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      env: { TESTSPRITE_CLIENT: 'github-action/v1' },
+    });
+    await client.get('/me');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores an invalid TESTSPRITE_CLIENT tag (User-Agent unchanged, value never sent)', async () => {
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      expect(headers.get('user-agent')).toBe(`testsprite-cli/${VERSION}`);
+      return jsonResponse({});
+    });
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      env: { TESTSPRITE_CLIENT: 'not a tag (nope)' },
+    });
+    await client.get('/me');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it('honors a caller-supplied requestId', async () => {
     const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const headers = new Headers(init?.headers);
