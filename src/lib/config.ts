@@ -72,7 +72,9 @@ export function readConfigFileSettings(
   const path = options.path ?? env.TESTSPRITE_CONFIG_FILE ?? defaultConfigPath();
   let content: string;
   try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `path` is the settings-file path this module owns (default `~/.testsprite/config`, or `TESTSPRITE_CONFIG_FILE` / the caller-supplied `ReadConfigFileOptions.path`), not new external input; identical risk profile to the baselined credentials-file reads in `lib/credentials.ts`.
     if (!existsSync(path)) return {};
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same internal settings-file path as the existsSync above.
     content = readFileSync(path, 'utf-8');
   } catch {
     // Unreadable settings file: settings are optional, never fatal.

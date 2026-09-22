@@ -131,6 +131,7 @@ describe('defaultConfigPath', () => {
 describe('readConfigFileSettings + the config-file layer of loadConfig', () => {
   function writeConfigFile(content: string): string {
     const path = join(mkdtempSync(join(tmpdir(), 'testsprite-config-')), 'config');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test-only fixture written into a freshly created temp dir from mkdtempSync, never external input.
     writeFileSync(path, content, 'utf8');
     return path;
   }
