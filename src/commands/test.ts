@@ -15128,7 +15128,10 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '  6  conflict (already running — see nextAction for the active runId)\n' +
         '  7  timeout — resume with: testsprite test wait <run-id>, ' +
         'or stop it with: testsprite test cancel <run-id>\n' +
-        ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
+        ' 10  transport/network failure (UNAVAILABLE). If it printed a runId with status\n' +
+        '     running, that run keeps executing: re-attach with testsprite test wait\n' +
+        '     <run-id> (running this command again triggers and bills a new run).\n' +
+        '     Otherwise retry the command\n' +
         ' 11  rate limited — honor Retry-After, or the in-flight run cap was hit\n' +
         '     (details.reason "inflight_cap"; see: testsprite test run --help)\n' +
         '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>\n' +
